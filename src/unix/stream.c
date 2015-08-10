@@ -1222,6 +1222,7 @@ static void uv__stream_connect(uv_stream_t* stream) {
   } else {
     /* Normal situation: we need to get the socket error from the kernel. */
     assert(uv__stream_fd(stream) >= 0);
+    error = 0;
     getsockopt(uv__stream_fd(stream),
                SOL_SOCKET,
                SO_ERROR,
