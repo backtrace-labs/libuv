@@ -79,6 +79,8 @@ libuv_la_SOURCES += src/win/async.c \
 
 else  # WINNT
 
+EXTRA_DIST=LICENSE
+
 include_HEADERS += include/uv-unix.h
 AM_CPPFLAGS += -I$(top_srcdir)/src/unix
 libuv_la_CFLAGS += -g --std=gnu89 -pedantic -Wall -Wextra -Wno-unused-parameter
