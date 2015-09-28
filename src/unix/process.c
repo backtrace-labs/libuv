@@ -45,77 +45,70 @@ extern char **environ;
 #endif
 
 
-static QUEUE* uv__process_queue(uv_loop_t* loop, int pid) {
-  assert(pid > 0);
-  return loop->process_handles + pid % ARRAY_SIZE(loop->process_handles);
-}
-
-
 static void uv__chld(uv_signal_t* handle, int signum) {
   uv_process_t* process;
   uv_loop_t* loop;
   int exit_status;
   int term_signal;
-  unsigned int i;
   int status;
   pid_t pid;
   QUEUE pending;
-  QUEUE* h;
   QUEUE* q;
+  QUEUE* h;
 
   assert(signum == SIGCHLD);
 
   QUEUE_INIT(&pending);
   loop = handle->loop;
 
-  for (i = 0; i < ARRAY_SIZE(loop->process_handles); i++) {
-    h = loop->process_handles + i;
-    q = QUEUE_HEAD(h);
+  h = &loop->process_handles;
+  q = QUEUE_HEAD(h);
+  while (q != h) {
+    process = QUEUE_DATA(q, uv_process_t, queue);
+    q = QUEUE_NEXT(q);
 
-    while (q != h) {
-      process = QUEUE_DATA(q, uv_process_t, queue);
-      q = QUEUE_NEXT(q);
+    do
+      pid = waitpid(process->pid, &status, WNOHANG);
+    while (pid == -1 && errno == EINTR);
 
-      do
-        pid = waitpid(process->pid, &status, WNOHANG);
-      while (pid == -1 && errno == EINTR);
+    if (pid == 0)
+      continue;
 
-      if (pid == 0)
-        continue;
-
-      if (pid == -1) {
-        if (errno != ECHILD)
-          abort();
-        continue;
-      }
-
-      process->status = status;
-      QUEUE_REMOVE(&process->queue);
-      QUEUE_INSERT_TAIL(&pending, &process->queue);
+    if (pid == -1) {
+      if (errno != ECHILD)
+        abort();
+      continue;
     }
 
-    while (!QUEUE_EMPTY(&pending)) {
-      q = QUEUE_HEAD(&pending);
-      QUEUE_REMOVE(q);
-      QUEUE_INIT(q);
-
-      process = QUEUE_DATA(q, uv_process_t, queue);
-      uv__handle_stop(process);
-
-      if (process->exit_cb == NULL)
-        continue;
-
-      exit_status = 0;
-      if (WIFEXITED(process->status))
-        exit_status = WEXITSTATUS(process->status);
-
-      term_signal = 0;
-      if (WIFSIGNALED(process->status))
-        term_signal = WTERMSIG(process->status);
-
-      process->exit_cb(process, exit_status, term_signal);
-    }
+    process->status = status;
+    QUEUE_REMOVE(&process->queue);
+    QUEUE_INSERT_TAIL(&pending, &process->queue);
   }
+
+  h = &pending;
+  q = QUEUE_HEAD(h);
+  while (q != h) {
+    process = QUEUE_DATA(q, uv_process_t, queue);
+    q = QUEUE_NEXT(q);
+
+    QUEUE_REMOVE(&process->queue);
+    QUEUE_INIT(&process->queue);
+    uv__handle_stop(process);
+
+    if (process->exit_cb == NULL)
+      continue;
+
+    exit_status = 0;
+    if (WIFEXITED(process->status))
+      exit_status = WEXITSTATUS(process->status);
+
+    term_signal = 0;
+    if (WIFSIGNALED(process->status))
+      term_signal = WTERMSIG(process->status);
+
+    process->exit_cb(process, exit_status, term_signal);
+  }
+  assert(QUEUE_EMPTY(&pending));
 }
 
 
@@ -287,6 +280,21 @@ static void uv__process_child_init(const uv_process_options_t* options,
   if (options->flags & UV_PROCESS_DETACHED)
     setsid();
 
+  /* First duplicate low numbered fds, since it's not safe to duplicate them,
+   * they could get replaced. Example: swapping stdout and stderr; without
+   * this fd 2 (stderr) would be duplicated into fd 1, thus making both
+   * stdout and stderr go to the same fd, which was not the intention. */
+  for (fd = 0; fd < stdio_count; fd++) {
+    use_fd = pipes[fd][1];
+    if (use_fd < 0 || use_fd >= fd)
+      continue;
+    pipes[fd][1] = fcntl(use_fd, F_DUPFD, stdio_count);
+    if (pipes[fd][1] == -1) {
+      uv__write_int(error_fd, -errno);
+      _exit(127);
+    }
+  }
+
   for (fd = 0; fd < stdio_count; fd++) {
     close_fd = pipes[fd][0];
     use_fd = pipes[fd][1];
@@ -311,7 +319,12 @@ static void uv__process_child_init(const uv_process_options_t* options,
     if (fd == use_fd)
       uv__cloexec(use_fd, 0);
     else
-      dup2(use_fd, fd);
+      fd = dup2(use_fd, fd);
+
+    if (fd == -1) {
+      uv__write_int(error_fd, -errno);
+      _exit(127);
+    }
 
     if (fd <= 2)
       uv__nonblock(fd, 0);
@@ -323,8 +336,8 @@ static void uv__process_child_init(const uv_process_options_t* options,
   for (fd = 0; fd < stdio_count; fd++) {
     use_fd = pipes[fd][1];
 
-    if (use_fd >= 0 && fd != use_fd)
-      close(use_fd);
+    if (use_fd >= stdio_count)
+      uv__close(use_fd);
   }
 
   if (options->cwd != NULL && chdir(options->cwd)) {
@@ -369,12 +382,12 @@ int uv_spawn(uv_loop_t* loop,
   int signal_pipe[2] = { -1, -1 };
   int (*pipes)[2];
   int stdio_count;
-  QUEUE* q;
   ssize_t r;
   pid_t pid;
   int err;
   int exec_errorno;
   int i;
+  int status;
 
   assert(options->file != NULL);
   assert(!(options->flags & ~(UV_PROCESS_DETACHED |
@@ -391,7 +404,7 @@ int uv_spawn(uv_loop_t* loop,
     stdio_count = 3;
 
   err = -ENOMEM;
-  pipes = malloc(stdio_count * sizeof(*pipes));
+  pipes = uv__malloc(stdio_count * sizeof(*pipes));
   if (pipes == NULL)
     goto error;
 
@@ -461,11 +474,17 @@ int uv_spawn(uv_loop_t* loop,
 
   if (r == 0)
     ; /* okay, EOF */
-  else if (r == sizeof(exec_errorno))
-    ; /* okay, read errorno */
-  else if (r == -1 && errno == EPIPE)
-    ; /* okay, got EPIPE */
-  else
+  else if (r == sizeof(exec_errorno)) {
+    do
+      err = waitpid(pid, &status, 0); /* okay, read errorno */
+    while (err == -1 && errno == EINTR);
+    assert(err == pid);
+  } else if (r == -1 && errno == EPIPE) {
+    do
+      err = waitpid(pid, &status, 0); /* okay, got EPIPE */
+    while (err == -1 && errno == EINTR);
+    assert(err == pid);
+  } else
     abort();
 
   uv__close(signal_pipe[0]);
@@ -483,15 +502,14 @@ int uv_spawn(uv_loop_t* loop,
 
   /* Only activate this handle if exec() happened successfully */
   if (exec_errorno == 0) {
-    q = uv__process_queue(loop, pid);
-    QUEUE_INSERT_TAIL(q, &process->queue);
+    QUEUE_INSERT_TAIL(&loop->process_handles, &process->queue);
     uv__handle_start(process);
   }
 
   process->pid = pid;
   process->exit_cb = options->exit_cb;
 
-  free(pipes);
+  uv__free(pipes);
   return exec_errorno;
 
 error:
@@ -505,7 +523,7 @@ error:
       if (pipes[i][1] != -1)
         close(pipes[i][1]);
     }
-    free(pipes);
+    uv__free(pipes);
   }
 
   return err;
@@ -526,7 +544,8 @@ int uv_kill(int pid, int signum) {
 
 
 void uv__process_close(uv_process_t* handle) {
-  /* TODO stop signal watcher when this is the last handle */
   QUEUE_REMOVE(&handle->queue);
   uv__handle_stop(handle);
+  if (QUEUE_EMPTY(&handle->loop->process_handles))
+    uv_signal_stop(&handle->loop->child_watcher);
 }
